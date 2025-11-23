@@ -1,0 +1,304 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <wiringPi.h>
+#include <lcd.h>       
+#include <softPwm.h>   
+#include <time.h>      
+#include <pthread.h>
+
+
+// 1. 하드웨어 핀 정의 
+
+// Text LCD 
+#define LCD_RS  2
+#define LCD_E   4
+#define LCD_D4  20
+#define LCD_D5  21
+#define LCD_D6  12
+#define LCD_D7  16
+
+// 초음파 센서
+#define US_FOOD_TRIG 5   // 사료 잔량
+#define US_FOOD_ECHO 6   // 사료 잔량 
+#define US_DOG_TRIG  23  // 반려견 감지
+#define US_DOG_ECHO  24  // 반려견 감지
+
+// 액추에이터
+#define SERVO_PIN    18  // 서보모터
+#define BUZZER_PIN   26  // 부저
+
+// 버튼 
+#define BTN_UP    17  // 위 
+#define BTN_DOWN  27  // 아래 
+#define BTN_OK    22  // 확인
+#define BTN_PREV  13  // 이전
+
+// 2. 구조체 및 전역 변수 정의
+
+
+//  
+typedef struct {
+    int weight;          // 설정된 강아지 몸무게 (1~20kg)
+    int open_duration;   // 모터 열림 시간 (ms)
+    int state;           // 시스템 상태 (0:설정, 1:메뉴, 2:실행)
+    int mode;            // 급식 모드 (1:수동, 2:센서, 3:타이머)
+    int fed_morning;     // 아침 급식 완료 플래그 
+    int fed_evening;     // 저녁 급식 완료 플래그 
+    int is_empty;        // 사료 부족 알림 플래그 
+} FeederSystem;
+
+FeederSystem sys = { 3, 0, 0, 1, 0, 0, 0 }; // 초기값 설정
+int lcd; // LCD 핸들
+
+
+// 3. 함수 프로토타입 선언
+
+int init_hardware();
+float get_distance(int trig, int echo);
+void dispense_food();
+void calculate_duration();
+void run_setup_mode();
+void run_menu_mode();
+void run_execution_mode();
+
+
+// 사료 잔량 실시간 모니터링
+
+PI_THREAD(monitor_thread) {
+    while (1) {
+        float dist = get_distance(US_FOOD_TRIG, US_FOOD_ECHO);
+
+        // 15cm 이상이면 사료가 없는 것으로 판단
+        if (dist > 15.0) {
+            sys.is_empty = 1;
+            // 경고음 패턴: 삐- 삐-
+            digitalWrite(BUZZER_PIN, HIGH); delay(100);
+            digitalWrite(BUZZER_PIN, LOW);  delay(100);
+            digitalWrite(BUZZER_PIN, HIGH); delay(100);
+            digitalWrite(BUZZER_PIN, LOW);
+            delay(2000);
+        }
+        else if (dist > 0) { // 0은 에러값이므로 제외
+            sys.is_empty = 0;
+            delay(1000);
+        }
+    }
+}
+
+
+// 4. 메인 함수
+
+int main(void) {
+    // 하드웨어 초기화
+    if (init_hardware() == -1) return 1;
+
+    // 부팅 화면 출력
+    lcdClear(lcd);
+    lcdPosition(lcd, 0, 0); lcdPrintf(lcd, "Team: BaeSikJo");
+    lcdPosition(lcd, 0, 1); lcdPrintf(lcd, "System Start...");
+    delay(2000);
+
+    // 감시 쓰레드 시작
+    piThreadCreate(monitor_thread);
+
+    // 메인 루프 (상태 머신)
+    while (1) {
+        switch (sys.state) {
+        case 0: // 설정 화면
+            run_setup_mode();
+            break;
+        case 1: // 메뉴 선택 화면
+            run_menu_mode();
+            break;
+        case 2: // 동작 실행 화면
+            run_execution_mode();
+            break;
+        }
+        delay(50);
+    }
+    return 0;
+}
+
+
+// 5. 기능별 함수 구현
+
+// 몸무게 설정 화면
+void run_setup_mode() {
+    lcdPosition(lcd, 0, 0); lcdPrintf(lcd, "Set Weight:     ");
+    lcdPosition(lcd, 0, 1); lcdPrintf(lcd, "-> %d Kg        ", sys.weight);
+
+    if (digitalRead(BTN_UP) == LOW) {
+        sys.weight++; if (sys.weight > 20) sys.weight = 1;
+        delay(200);
+    }
+    if (digitalRead(BTN_DOWN) == LOW) {
+        sys.weight--; if (sys.weight < 1) sys.weight = 20;
+        delay(200);
+    }
+    if (digitalRead(BTN_OK) == LOW) {
+        calculate_duration(); // 시간 계산
+        sys.state = 1;        // 메뉴 선택으로 이동
+        lcdClear(lcd); delay(300);
+    }
+}
+
+// 메뉴 선택 화면
+void run_menu_mode() {
+    lcdPosition(lcd, 0, 0); lcdPrintf(lcd, "Select Mode: %d  ", sys.mode);
+
+    if (sys.mode == 1) { lcdPosition(lcd, 0, 1); lcdPrintf(lcd, "1.Manual(Btn)   "); }
+    else if (sys.mode == 2) { lcdPosition(lcd, 0, 1); lcdPrintf(lcd, "2.Auto(Sensor)  "); }
+    else if (sys.mode == 3) { lcdPosition(lcd, 0, 1); lcdPrintf(lcd, "3.Timer(Time)   "); }
+
+    if (digitalRead(BTN_UP) == LOW) {
+        sys.mode++; if (sys.mode > 3) sys.mode = 1;
+        delay(200);
+    }
+    if (digitalRead(BTN_DOWN) == LOW) {
+        sys.mode--; if (sys.mode < 1) sys.mode = 3;
+        delay(200);
+    }
+    if (digitalRead(BTN_OK) == LOW) {
+        sys.state = 2; // 실행 화면으로 이동
+        lcdClear(lcd); delay(300);
+    }
+    if (digitalRead(BTN_PREV) == LOW) {
+        sys.state = 0; // 무게 설정으로 복귀
+        lcdClear(lcd); delay(300);
+    }
+}
+
+// 실제 동작 실행 
+void run_execution_mode() {
+    // 1. 사료 부족 체크
+    if (sys.is_empty) {
+        lcdPosition(lcd, 0, 1); lcdPrintf(lcd, "Err: Empty Food!");
+    }
+
+    // 2. 시간 정보 가져오기
+    time_t now = time(NULL);
+    struct tm* t = localtime(&now);
+
+    //  모드 1: 수동 급식
+    if (sys.mode == 1) {
+        lcdPosition(lcd, 0, 0); lcdPrintf(lcd, "1.Push OK Key...");
+        if (digitalRead(BTN_OK) == LOW) dispense_food();
+    }
+
+    //  모드 2: 자동 감지 (아침/저녁 1회 제한) 
+    else if (sys.mode == 2) {
+        lcdPosition(lcd, 0, 0); lcdPrintf(lcd, "2.Detecting...  ");
+
+        float dist = get_distance(US_DOG_TRIG, US_DOG_ECHO);
+
+        int is_morning = (t->tm_hour >= 6 && t->tm_hour < 11);  // 아침 6~10시
+        int is_evening = (t->tm_hour >= 17 && t->tm_hour < 22); // 저녁 5~9시
+        int dog_near = (dist > 0 && dist < 30.0);             // 30cm 이내 감지
+
+        // 아침: 시간 맞고 + 안줬고 + 개가 왔으면
+        if (is_morning && !sys.fed_morning && dog_near) {
+            dispense_food();
+            sys.fed_morning = 1; // 아침 먹음 체크
+        }
+        // 저녁: 시간 맞고 + 안줬고 + 개가 왔으면
+        else if (is_evening && !sys.fed_evening && dog_near) {
+            dispense_food();
+            sys.fed_evening = 1; // 저녁 먹음 체크
+        }
+
+        // 자정에 초기화 
+        if (t->tm_hour == 0 && t->tm_min == 0) {
+            sys.fed_morning = 0; sys.fed_evening = 0;
+        }
+    }
+
+    // 모드 3: 타이머 급식
+    else if (sys.mode == 3) {
+        lcdPosition(lcd, 0, 0);
+        lcdPrintf(lcd, "3.Time: %02d:%02d   ", t->tm_hour, t->tm_min);
+
+        // 아침 7시 정각 OR 저녁 7시 정각
+        if ((t->tm_hour == 7 || t->tm_hour == 19) && t->tm_min == 0 && t->tm_sec == 0) {
+            dispense_food();
+            delay(1000); // 중복 실행 방지
+        }
+    }
+
+    // (공통) 뒤로 가기 버튼
+    if (digitalRead(BTN_PREV) == LOW) {
+        sys.state = 1;
+        lcdClear(lcd); delay(300);
+    }
+}
+
+
+// 6. 유틸리티 함수
+
+
+// 사료 배출 동작 (서보모터)
+void dispense_food() {
+    if (sys.is_empty) return; // 사료 없으면 작동 안 함
+
+    lcdClear(lcd);
+    lcdPosition(lcd, 0, 0); lcdPrintf(lcd, ">> Feeding... <<");
+
+    // 문 열기 (약 90도 - 값 24)
+    softPwmWrite(SERVO_PIN, 24);
+    delay(sys.open_duration); // 무게만큼 대기
+
+    // 문 닫기 (약 0도 - 값 5)
+    softPwmWrite(SERVO_PIN, 5);
+    delay(500);
+
+    lcdClear(lcd);
+}
+
+// 무게 -> 시간 변환
+void calculate_duration() {
+    // 1kg당 0.5초씩 문 열기 (기본 0.5초)
+    sys.open_duration = 500 + (sys.weight * 500);
+}
+
+// 초음파 거리 측정
+float get_distance(int trig, int echo) {
+    digitalWrite(trig, LOW); delayMicroseconds(2);
+    digitalWrite(trig, HIGH); delayMicroseconds(10);
+    digitalWrite(trig, LOW);
+
+    long timeout = micros();
+    while (digitalRead(echo) == LOW) {
+        if (micros() - timeout > 30000) return -1;
+    }
+    long start = micros();
+    while (digitalRead(echo) == HIGH) {
+        if (micros() - start > 30000) return -1;
+    }
+    long end = micros();
+    return (end - start) * 0.034 / 2.0;
+}
+
+// 하드웨어 초기화
+int init_hardware() {
+    if (wiringPiSetupGpio() == -1) return -1;
+
+    // 핀 모드 설정
+    pinMode(US_FOOD_TRIG, OUTPUT); pinMode(US_FOOD_ECHO, INPUT);
+    pinMode(US_DOG_TRIG, OUTPUT);  pinMode(US_DOG_ECHO, INPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+
+    // 버튼 내부 풀업 설정
+    int btns[] = { BTN_UP, BTN_DOWN, BTN_OK, BTN_PREV };
+    for (int i = 0; i < 4; i++) {
+        pinMode(btns[i], INPUT);
+        pullUpDnControl(btns[i], PUD_UP);
+    }
+
+    // 서보모터 초기화
+    softPwmCreate(SERVO_PIN, 5, 200);
+
+    // LCD 초기화
+    lcd = lcdInit(2, 16, 4, LCD_RS, LCD_E, LCD_D4, LCD_D5, LCD_D6, LCD_D7, 0, 0, 0, 0);
+    if (lcd < 0) return -1;
+
+    return 0;
+}
